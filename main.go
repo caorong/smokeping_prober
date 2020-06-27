@@ -35,6 +35,7 @@ import (
 var (
 	// Generated with: prometheus.ExponentialBuckets(0.00005, 2, 20)
 	defaultBuckets = "5e-05,0.0001,0.0002,0.0004,0.0008,0.0016,0.0032,0.0064,0.0128,0.0256,0.0512,0.1024,0.2048,0.4096,0.8192,1.6384,3.2768,6.5536,13.1072,26.2144"
+	resetCount     = 120
 )
 
 type hostList []string
@@ -79,6 +80,28 @@ func parseBuckets(buckets string) ([]float64, error) {
 	return bucketlist, nil
 }
 
+func createPingInst(hosts *[]string, interval *time.Duration, privileged *bool) []*ping.Pinger {
+	pingers := make([]*ping.Pinger, len(*hosts))
+	for i, host := range *hosts {
+		pinger, err := ping.NewPinger(host)
+		if err != nil {
+			log.Errorf("failed to create pinger: %s\n", err.Error())
+			return nil
+		}
+
+		pinger.Interval = *interval
+		pinger.Timeout = time.Duration(math.MaxInt64)
+		pinger.SetPrivileged(*privileged)
+		pinger.Count = resetCount + 5
+
+		log.Infof("Starting prober for %s", host)
+		go pinger.Run()
+
+		pingers[i] = pinger
+	}
+	return pingers
+}
+
 func main() {
 	var (
 		listenAddress = kingpin.Flag("web.listen-address", "Address on which to expose metrics and web interface.").Default(":9374").String()
@@ -105,35 +128,43 @@ func main() {
 	pingResponseSeconds := newPingResponseHistogram(bucketlist)
 	prometheus.MustRegister(pingResponseSeconds)
 
-	pingers := make([]*ping.Pinger, len(*hosts))
-	for i, host := range *hosts {
-		pinger, err := ping.NewPinger(host)
-		if err != nil {
-			log.Errorf("failed to create pinger: %s\n", err.Error())
-			return
+	pingers := createPingInst(hosts, interval, privileged)
+
+	smockpingCollector := NewSmokepingCollector(&pingers, *pingResponseSeconds)
+	prometheus.MustRegister(smockpingCollector)
+
+	// 定期 unregister register
+	timer1 := time.NewTicker(time.Duration(resetCount) * time.Second)
+	go func() {
+		for {
+			<-timer1.C
+			log.Debugf("start reset")
+
+			// create new pinger
+			newPingers := createPingInst(hosts, interval, privileged)
+			newPingResponseSeconds := newPingResponseHistogram(bucketlist)
+			newSmockpingCollector := NewSmokepingCollector(&newPingers, *newPingResponseSeconds)
+
+			prometheus.Unregister(pingResponseSeconds)
+			prometheus.Unregister(smockpingCollector)
+
+			prometheus.MustRegister(newPingResponseSeconds)
+			prometheus.MustRegister(newSmockpingCollector)
 		}
-
-		pinger.Interval = *interval
-		pinger.Timeout = time.Duration(math.MaxInt64)
-		pinger.SetPrivileged(*privileged)
-
-		log.Infof("Starting prober for %s", host)
-		go pinger.Run()
-
-		pingers[i] = pinger
-	}
-
-	prometheus.MustRegister(NewSmokepingCollector(&pingers, *pingResponseSeconds))
+	}()
 
 	http.Handle(*metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
+		_, err := w.Write([]byte(`<html>
 			<head><title>Smokeping Exporter</title></head>
 			<body>
 			<h1>Smokeping Exporter</h1>
 			<p><a href="` + *metricsPath + `">Metrics</a></p>
 			</body>
 			</html>`))
+		if err != nil {
+			log.Error("write data error!", err)
+		}
 	})
 	log.Infof("Listening on %s", *listenAddress)
 	log.Fatal(http.ListenAndServe(*listenAddress, nil))
